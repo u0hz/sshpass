@@ -1,5 +1,6 @@
 /*  This file is part of "sshpass", a tool for batch running password ssh authentication
- *  Copyright (C) 2006, 2015 Lingnu Open Source Consulting Ltd.
+ *  Copyright (C) 2006 Lingnu Open Source Consulting Ltd.
+ *  Copyright (C) 2015-2016, 2021 Shachar Shemesh
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -61,6 +62,13 @@ posix_openpt(int flags)
 #endif
 
 int runprogram( int argc, char *argv[] );
+void reliable_write( int fd, const void *data, size_t size );
+int handleoutput( int fd );
+void window_resize_handler(int signum);
+void sigchld_handler(int signum);
+void term_handler(int signum);
+int match( const char *reference, const char *buffer, ssize_t bufsize, int state );
+void write_pass( int fd );
 
 struct {
     enum { PWT_STDIN, PWT_FILE, PWT_FD, PWT_PASS } pwtype;
@@ -147,7 +155,7 @@ static int parse_options( int argc, char *argv[] )
 	    args.pwtype=PWT_PASS;
 	    args.pwsrc.password=getenv("SSHPASS");
             if( args.pwsrc.password==NULL ) {
-                fprintf(stderr, "sshpass: -e option given but SSHPASS environment variable not set\n");
+                fprintf(stderr, "SSHPASS: -e option given but SSHPASS environment variable not set\n");
 
                 error=RETURN_INVALID_ARGUMENTS;
             }
@@ -162,7 +170,7 @@ static int parse_options( int argc, char *argv[] )
 	case 'V':
 	    printf("%s\n"
                     "(C) 2006-2011 Lingnu Open Source Consulting Ltd.\n"
-                    "(C) 2015-2016 Shachar Shemesh\n"
+                    "(C) 2015-2016, 2021 Shachar Shemesh\n"
 		    "This program is free software, and can be distributed under the terms of the GPL\n"
 		    "See the COPYING file for more information.\n"
                     "\n"
@@ -198,21 +206,19 @@ int main( int argc, char *argv[] )
     return runprogram( argc-opt_offset, argv+opt_offset );
 }
 
-int handleoutput( int fd );
-
 /* Global variables so that this information be shared with the signal handler */
 static int ourtty; // Our own tty
 static int masterpt;
 
-void window_resize_handler(int signum);
-void sigchld_handler(int signum);
+int childpid;
+int term;
 
 int runprogram( int argc, char *argv[] )
 {
     struct winsize ttysize; // The size of our tty
 
     // We need to interrupt a select with a SIGCHLD. In order to do so, we need a SIGCHLD handler
-    signal( SIGCHLD,sigchld_handler );
+    signal( SIGCHLD, sigchld_handler );
 
     // Create a pseudo terminal for our process
     masterpt=posix_openpt(O_RDWR);
@@ -272,9 +278,32 @@ int runprogram( int argc, char *argv[] )
        complete, at which point we no longer need to monitor the TTY anyways.
      */
 
-    int childpid=fork();
+    sigset_t sigmask, sigmask_select;
+
+    // Set the signal mask during the select
+    sigemptyset(&sigmask_select);
+
+    // And during the regular run
+    sigemptyset(&sigmask);
+    sigaddset(&sigmask, SIGCHLD);
+    sigaddset(&sigmask, SIGHUP);
+    sigaddset(&sigmask, SIGTERM);
+    sigaddset(&sigmask, SIGINT);
+    sigaddset(&sigmask, SIGTSTP);
+
+    sigprocmask( SIG_SETMASK, &sigmask, NULL );
+
+    signal(SIGHUP, term_handler);
+    signal(SIGTERM, term_handler);
+    signal(SIGINT, term_handler);
+    signal(SIGTSTP, term_handler);
+
+    childpid=fork();
     if( childpid==0 ) {
 	// Child
+
+        // Re-enable all signals to child
+        sigprocmask( SIG_SETMASK, &sigmask_select, NULL );
 
 	// Detach us from the current TTY
 	setsid();
@@ -296,11 +325,11 @@ int runprogram( int argc, char *argv[] )
 
 	execvp( new_argv[0], new_argv );
 
-	perror("sshpass: Failed to run command");
+	perror("SSHPASS: Failed to run command");
 
 	exit(RETURN_RUNTIME_ERROR);
     } else if( childpid<0 ) {
-	perror("sshpass: Failed to create child process");
+	perror("SSHPASS: Failed to create child process");
 
 	return RETURN_RUNTIME_ERROR;
     }
@@ -311,16 +340,6 @@ int runprogram( int argc, char *argv[] )
     int status=0;
     int terminate=0;
     pid_t wait_id;
-    sigset_t sigmask, sigmask_select;
-
-    // Set the signal mask during the select
-    sigemptyset(&sigmask_select);
-
-    // And during the regular run
-    sigemptyset(&sigmask);
-    sigaddset(&sigmask, SIGCHLD);
-
-    sigprocmask( SIG_SETMASK, &sigmask, NULL );
 
     do {
 	if( !terminate ) {
@@ -366,9 +385,6 @@ int runprogram( int argc, char *argv[] )
 	return 255;
 }
 
-int match( const char *reference, const char *buffer, ssize_t bufsize, int state );
-void write_pass( int fd );
-
 int handleoutput( int fd )
 {
     // We are looking for the string
@@ -389,13 +405,13 @@ int handleoutput( int fd )
 
     if( args.verbose && firsttime ) {
         firsttime=0;
-        fprintf(stderr, "SSHPASS searching for password prompt using match \"%s\"\n", compare1);
+        fprintf(stderr, "SSHPASS: searching for password prompt using match \"%s\"\n", compare1);
     }
 
     int numread=read(fd, buffer, sizeof(buffer)-1 );
     buffer[numread] = '\0';
     if( args.verbose ) {
-        fprintf(stderr, "SSHPASS read: %s\n", buffer);
+        fprintf(stderr, "SSHPASS: read: %s\n", buffer);
     }
 
     state1=match( compare1, buffer, numread, state1 );
@@ -404,14 +420,14 @@ int handleoutput( int fd )
     if( compare1[state1]=='\0' ) {
 	if( !prevmatch ) {
             if( args.verbose )
-                fprintf(stderr, "SSHPASS detected prompt. Sending password.\n");
+                fprintf(stderr, "SSHPASS: detected prompt. Sending password.\n");
 	    write_pass( fd );
 	    state1=0;
 	    prevmatch=1;
 	} else {
 	    // Wrong password - terminate with proper error code
             if( args.verbose )
-                fprintf(stderr, "SSHPASS detected prompt, again. Wrong password. Terminating.\n");
+                fprintf(stderr, "SSHPASS: detected prompt, again. Wrong password. Terminating.\n");
 	    ret=RETURN_INCORRECT_PASSWORD;
 	}
     }
@@ -422,7 +438,7 @@ int handleoutput( int fd )
         // Are we being prompted to authenticate the host?
         if( compare2[state2]=='\0' ) {
             if( args.verbose )
-                fprintf(stderr, "SSHPASS detected host authentication prompt. Exiting.\n");
+                fprintf(stderr, "SSHPASS: detected host authentication prompt. Exiting.\n");
             ret=RETURN_HOST_KEY_UNKNOWN;
         }
     }
@@ -464,12 +480,14 @@ void write_pass( int fd )
 	    if( srcfd!=-1 ) {
 		write_pass_fd( srcfd, fd );
 		close( srcfd );
+	    } else {
+	        fprintf(stderr, "SSHPASS: Failed to open password file \"%s\": %s\n", args.pwsrc.filename, strerror(errno));
 	    }
 	}
 	break;
     case PWT_PASS:
-	write( fd, args.pwsrc.password, strlen( args.pwsrc.password ) );
-	write( fd, "\n", 1 );
+	reliable_write( fd, args.pwsrc.password, strlen( args.pwsrc.password ) );
+	reliable_write( fd, "\n", 1 );
 	break;
     }
 }
@@ -486,13 +504,13 @@ void write_pass_fd( int srcfd, int dstfd )
 	done=(numread<1);
 	for( i=0; i<numread && !done; ++i ) {
 	    if( buffer[i]!='\n' )
-		write( dstfd, buffer+i, 1 );
+		reliable_write( dstfd, buffer+i, 1 );
 	    else
 		done=1;
 	}
     }
 
-    write( dstfd, "\n", 1 );
+    reliable_write( dstfd, "\n", 1 );
 }
 
 void window_resize_handler(int signum)
@@ -506,4 +524,35 @@ void window_resize_handler(int signum)
 // Do nothing handler - makes sure the select will terminate if the signal arrives, though.
 void sigchld_handler(int signum)
 {
+}
+
+void term_handler(int signum)
+{
+    fflush(stdout);
+    switch(signum) {
+    case SIGINT:
+        reliable_write(masterpt, "\x03", 1);
+        break;
+    case SIGTSTP:
+        reliable_write(masterpt, "\x1a", 1);
+        break;
+    default:
+        if( childpid>0 ) {
+            kill( childpid, signum );
+        }
+    }
+
+    term = 1;
+}
+
+void reliable_write( int fd, const void *data, size_t size )
+{
+    ssize_t result = write( fd, data, size );
+    if( result!=size ) {
+        if( result<0 ) {
+            perror("SSHPASS: write failed");
+        } else {
+            fprintf(stderr, "SSHPASS: Short write. Tried to write %lu, only wrote %ld\n", size, result);
+        }
+    }
 }
