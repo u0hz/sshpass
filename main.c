@@ -147,10 +147,17 @@ int main( int argc, char *argv[] )
 
 int handleoutput( int fd );
 
+/* Global variables so that this information be shared with the signal handler */
+static int ourtty; // Our own tty
+static int masterpt;
+
+void window_resize_handler(int signum);
+
 int runprogram( int argc, char *argv[] )
 {
+    struct winsize ttysize; // The size of our tty
     // Create a pseudo terminal for our process
-    int masterpt=getpt();
+    masterpt=getpt();
 
     if( masterpt==-1 ) {
 	perror("Failed to get a pseudo terminal");
@@ -169,6 +176,13 @@ int runprogram( int argc, char *argv[] )
 	return 1;
     }
 
+    ourtty=open("/dev/tty", 0);
+    if( ourtty!=-1 && ioctl( ourtty, TIOCGWINSZ, &ttysize )==0 ) {
+        signal(SIGWINCH, window_resize_handler);
+
+        ioctl( masterpt, TIOCSWINSZ, &ttysize );
+    }
+
     int childpid=fork();
     if( childpid==0 ) {
 	// Child
@@ -177,9 +191,10 @@ int runprogram( int argc, char *argv[] )
 	setsid();
 	
 	const char *name=ptsname(masterpt);
-	int slavept=open(name, O_RDWR );
+	int slavept=open(name, O_RDWR ); // This line makes the ptty our controlling tty. We do not otherwise need it open
 	//fprintf(stderr, "Opened %s with fd %d\n", name, slavept);
 	close( masterpt );
+        close( slavept );
 
 	char **new_argv=malloc(sizeof(char *)*(argc+1));
 
@@ -332,4 +347,12 @@ void write_pass_fd( int srcfd, int dstfd )
     }
 
     write( dstfd, "\n", 1 );
+}
+
+void window_resize_handler(int signum)
+{
+    struct winsize ttysize; // The size of our tty
+
+    if( ioctl( ourtty, TIOCGWINSZ, &ttysize )==0 )
+        ioctl( masterpt, TIOCSWINSZ, &ttysize );
 }
