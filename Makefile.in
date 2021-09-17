@@ -318,7 +318,6 @@ distdir: $(DISTFILES)
 	    || cp -p $$d/$$file $(distdir)/$$file || :; \
 	  fi; \
 	done
-main.o: main.c config.h
 
 info-am:
 info: info-am
