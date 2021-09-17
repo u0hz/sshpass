@@ -33,12 +33,22 @@
 #if HAVE_TERMIOS_H
 #include <termios.h>
 #endif
-//#include <asm/ioctls.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
+
+enum program_return_codes {
+    RETURN_NOERROR,
+    RETURN_INVALID_ARGUMENTS,
+    RETURN_CONFLICTING_ARGUMENTS,
+    RETURN_RUNTIME_ERROR,
+    RETURN_PARSE_ERRROR,
+    RETURN_INCORRECT_PASSWORD,
+    RETURN_HOST_KEY_UNKNOWN,
+    RETURN_HOST_KEY_CHANGED,
+};
 
 // Some systems don't define posix_openpt
 #ifndef HAVE_POSIX_OPENPT
@@ -62,7 +72,7 @@ struct {
 
 static void show_help()
 {
-    printf("Usage: " PACKAGE_NAME " -fdph command parameters\n"
+    printf("Usage: " PACKAGE_NAME " [-f|-d|-p|-e] [-hV] command parameters\n"
 	    "   -f filename   Take password to use from file\n"
 	    "   -d number     Use number as file descriptor for getting password\n"
 	    "   -p password   Provide password as argument (security unwise)\n"
@@ -77,7 +87,7 @@ static void show_help()
 // on success, and a negative number on failure
 static int parse_options( int argc, char *argv[] )
 {
-    int error=0;
+    int error=-1;
     int opt;
 
     // Set the default password source to stdin
@@ -86,9 +96,9 @@ static int parse_options( int argc, char *argv[] )
 
 #define VIRGIN_PWTYPE if( args.pwtype!=PWT_STDIN ) { \
     fprintf(stderr, "Conflicting password source\n"); \
-    error=-3; }
+    error=RETURN_CONFLICTING_ARGUMENTS; }
 
-    while( (opt=getopt(argc, argv, "+f:d:p:heV"))!=-1 && error==0 ) {
+    while( (opt=getopt(argc, argv, "+f:d:p:heV"))!=-1 && error==-1 ) {
 	switch( opt ) {
 	case 'f':
 	    // Password should come from a file
@@ -119,13 +129,13 @@ static int parse_options( int argc, char *argv[] )
 	    break;
 	case '?':
 	case ':':
-	    error=-2;
+	    error=RETURN_INVALID_ARGUMENTS;
 	    break;
 	case 'h':
-	    error=-1;
+	    error=RETURN_NOERROR;
 	    break;
 	case 'V':
-	    printf("%s (C) 2006 Lingnu Open Source Consulting Ltd.\n"
+	    printf("%s (C) 2006-2008 Lingnu Open Source Consulting Ltd.\n"
 		    "This program is free software, and can be distributed under the terms of the GPL\n"
 		    "See the COPYING file for more information.\n", PACKAGE_STRING );
 	    exit(0);
@@ -133,10 +143,10 @@ static int parse_options( int argc, char *argv[] )
 	}
     }
 
-    if( error==0 )
-	return optind;
+    if( error>=0 )
+	return -(error+1);
     else
-	return error;
+	return optind;
 }
 
 int main( int argc, char *argv[] )
@@ -147,10 +157,7 @@ int main( int argc, char *argv[] )
 	// There was some error
 	show_help();
 
-	if( opt_offset==-1 )
-	    return 0;
-	else
-	    return -opt_offset;
+        return -(opt_offset+1); // -1 becomes 0, -2 becomes 1 etc.
     }
 
     return runprogram( argc-opt_offset, argv+opt_offset );
@@ -173,18 +180,18 @@ int runprogram( int argc, char *argv[] )
     if( masterpt==-1 ) {
 	perror("Failed to get a pseudo terminal");
 
-	return 1;
+	return RETURN_RUNTIME_ERROR;
     }
 
     if( grantpt( masterpt )!=0 ) {
 	perror("Failed to change pseudo terminal's permission");
 
-	return 1;
+	return RETURN_RUNTIME_ERROR;
     }
     if( unlockpt( masterpt )!=0 ) {
 	perror("Failed to unlock pseudo terminal");
 
-	return 1;
+	return RETURN_RUNTIME_ERROR;
     }
 
     ourtty=open("/dev/tty", 0);
@@ -221,11 +228,11 @@ int runprogram( int argc, char *argv[] )
 
 	perror("sshpass: Failed to run command");
 
-	exit(errno);
+	exit(RETURN_RUNTIME_ERROR);
     } else if( childpid<0 ) {
 	perror("sshpass: Failed to create child process");
 
-	return errno;
+	return RETURN_RUNTIME_ERROR;
     }
 	
     // We are the parent
@@ -243,10 +250,11 @@ int runprogram( int argc, char *argv[] )
 
 	    if( selret>0 ) {
 		if( FD_ISSET( masterpt, &readfd ) ) {
-		    if( handleoutput( masterpt ) ) {
+                    int ret;
+		    if( (ret=handleoutput( masterpt )) ) {
 			// Authentication failed - need to abort
 			close( masterpt ); // Signal ssh that it's controlling TTY is now closed
-			terminate=255; // This is what openssh returns on authentication errors
+			terminate=ret;
 		    }
 		}
 	    }
@@ -271,26 +279,39 @@ int handleoutput( int fd )
 {
     // We are looking for the string
     static int prevmatch=0; // If the "password" prompt is repeated, we have the wrong password.
-    static int state;
-    static const char compare[]="assword:";
+    static int state1, state2;
+    static const char compare1[]="assword:"; // Asking for a password
+    static const char compare2[]="The authenticity of host "; // Asks to authenticate host
+    // static const char compare3[]="WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"; // Warns about man in the middle attack
+    // The remote identification changed error is sent to stderr, not the tty, so we do not handle it.
+    // This is not a problem, as ssh exists immediately in such a case
     char buffer[40];
     int ret=0;
 
     int numread=read(fd, buffer, sizeof(buffer) );
 
-    state=match( compare, buffer, numread, state );
+    state1=match( compare1, buffer, numread, state1 );
 
-    if( compare[state]=='\0' ) {
+    // Are we at a password prompt?
+    if( compare1[state1]=='\0' ) {
 	if( !prevmatch ) {
 	    write_pass( fd );
-	    state=0;
+	    state1=0;
 	    prevmatch=1;
 	} else {
 	    // Wrong password - terminate with proper error code
-	    ret=1;
+	    ret=RETURN_INCORRECT_PASSWORD;
 	}
     }
 
+    if( ret==0 ) {
+        state2=match( compare2, buffer, numread, state2 );
+
+        // Are we being prompted to authenticate the host?
+        if( compare2[state2]=='\0' ) {
+            ret=RETURN_HOST_KEY_UNKNOWN;
+        }
+    }
 
     return ret;
 }
